@@ -5,11 +5,12 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Literal, Any, Dict
 
-app = FastAPI(title="AlphaGuard US API", version="0.2.0")
+app = FastAPI(title="AlphaGuard US API", version="0.3.0")
 
 ALPACA_KEY = os.getenv("ALPACA_KEY_ID", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_DATA_BASE = "https://data.alpaca.markets"
+
 
 def alpaca_headers():
     if not ALPACA_KEY or not ALPACA_SECRET:
@@ -18,6 +19,7 @@ def alpaca_headers():
         "APCA-API-KEY-ID": ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
+
 
 # ---------------- Models ----------------
 class OHLCVBar(BaseModel):
@@ -28,10 +30,12 @@ class OHLCVBar(BaseModel):
     close: float
     volume: float
 
+
 class GuardrailsIn(BaseModel):
     market: Literal["US"] = "US"
     timeframe: str
     bars: List[OHLCVBar]
+
 
 class GuardrailsOut(BaseModel):
     validation_level: Literal["L0", "L1", "L2"]
@@ -39,10 +43,12 @@ class GuardrailsOut(BaseModel):
     block_reason: Optional[str] = None
     warnings: List[str] = []
 
+
 class TAIn(BaseModel):
     market: Literal["US"] = "US"
     timeframe: str
     bars: List[OHLCVBar]
+
 
 class TAOut(BaseModel):
     trend_state: Literal["up", "down", "range", "unknown"]
@@ -51,24 +57,80 @@ class TAOut(BaseModel):
     R1: Optional[float] = None
     invalidation: str
 
+
 # ---------------- Helpers ----------------
-def _normalize_alpaca_bars(payload: Dict[str, Any], symbol: str) -> List[Dict[str, Any]]:
-    """
-    Alpaca /v2/stocks/bars 可能返回：
-    - {"bars": {"AAPL": [ {...}, {...} ]}}
-    - 或 {"bars": [ {...}, {...} ]} （较少见）
-    这里统一成 list[dict]
-    """
-    bars_obj = payload.get("bars", {})
-
-    if isinstance(bars_obj, dict):
-        return bars_obj.get(symbol.upper(), []) or []
-    if isinstance(bars_obj, list):
-        return bars_obj
-    return []
-
 def _iso_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _to_bar_list_from_columnar(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    有些返回可能是列式：
+    {"t":[...], "o":[...], "h":[...], "l":[...], "c":[...], "v":[...]}
+    """
+    keys = ["t", "o", "h", "l", "c", "v"]
+    if not all(isinstance(d.get(k), list) for k in keys):
+        return []
+    t, o, h, l, c, v = (d["t"], d["o"], d["h"], d["l"], d["c"], d["v"])
+    n = min(len(t), len(o), len(h), len(l), len(c), len(v))
+    return [{"t": t[i], "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i]} for i in range(n)]
+
+
+def _normalize_alpaca_bars(payload: Dict[str, Any], symbol: str) -> List[Dict[str, Any]]:
+    """
+    兼容 Alpaca bars 多种返回形态，最终统一为 list[dict]，dict 至少含 t,o,h,l,c,v
+    """
+    sym = symbol.upper()
+    bars_obj = payload.get("bars", None)
+
+    # 1) bars 是 dict：{"AAPL": [ {...}, {...} ]} 或 {"AAPL": {...列式...}}
+    if isinstance(bars_obj, dict):
+        v = bars_obj.get(sym) or bars_obj.get(symbol) or bars_obj.get(sym.replace(".", ""))
+        if isinstance(v, list):
+            # list 中必须是 dict，否则返回空
+            return [x for x in v if isinstance(x, dict)]
+        if isinstance(v, dict):
+            # a) 可能内层还有 bars list
+            if isinstance(v.get("bars"), list):
+                return [x for x in v["bars"] if isinstance(x, dict)]
+            # b) 可能是列式结构
+            col = _to_bar_list_from_columnar(v)
+            if col:
+                return col
+            # c) 兜底：如果 v 本身就是单根 bar dict（极少见）
+            if all(k in v for k in ["t", "o", "h", "l", "c", "v"]):
+                return [v]
+        # 如果 bars_obj 本身就是 “symbol->something” 但不是 list/dict，返回空
+        return []
+
+    # 2) bars 是 list：可能每个元素含 "S" 标记所属 symbol（多标的）
+    if isinstance(bars_obj, list):
+        if not bars_obj:
+            return []
+        if isinstance(bars_obj[0], dict):
+            # a) 多标的 list：每根 bar 里带 "S"
+            if "S" in bars_obj[0]:
+                return [b for b in bars_obj if isinstance(b, dict) and b.get("S") == sym]
+            # b) 单标的 list：直接就是 bar dict
+            return [b for b in bars_obj if isinstance(b, dict)]
+        # 如果 list 元素不是 dict（比如字符串），直接判为空
+        return []
+
+    return []
+
+
+def _get_bar_field(b: Dict[str, Any], key: str) -> Any:
+    """
+    兼容大小写 / 可能的替代键
+    """
+    if key in b:
+        return b[key]
+    # 一些实现会出现大写（不常见，但兜底）
+    alt = key.upper()
+    if alt in b:
+        return b[alt]
+    return None
+
 
 # ---------------- Endpoints ----------------
 @app.get("/us/bars")
@@ -83,7 +145,7 @@ def get_us_bars(
     if session != "regular":
         raise HTTPException(400, "MVP supports session=regular only")
 
-    # ✅ 默认拉最近 7 天，避免盘前/当天无 bars 返回空
+    # 默认拉最近 7 天，避免盘前/当天无 bars
     now = datetime.now(timezone.utc)
     if start is None:
         start = _iso_utc(now - timedelta(days=7))
@@ -97,7 +159,6 @@ def get_us_bars(
         "limit": limit,
         "start": start,
         "end": end,
-        # 免费/默认通常用 iex；如你有 SIP 订阅可改成 "sip"
         "feed": "iex",
     }
 
@@ -108,14 +169,31 @@ def get_us_bars(
     data = r.json()
     bars_list = _normalize_alpaca_bars(data, symbol)
 
-    out = [{
-        "timestamp": b["t"],
-        "open": b["o"],
-        "high": b["h"],
-        "low": b["l"],
-        "close": b["c"],
-        "volume": b["v"],
-    } for b in bars_list]
+    # 这里再做一层防御：如果仍不是 list[dict]，就直接返回空而不是 500
+    out = []
+    for b in bars_list:
+        if not isinstance(b, dict):
+            continue
+
+        t = _get_bar_field(b, "t")
+        o = _get_bar_field(b, "o")
+        h = _get_bar_field(b, "h")
+        l = _get_bar_field(b, "l")
+        c = _get_bar_field(b, "c")
+        v = _get_bar_field(b, "v")
+
+        if t is None or o is None or h is None or l is None or c is None or v is None:
+            # 跳过不完整 bar，避免炸
+            continue
+
+        out.append({
+            "timestamp": t,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+        })
 
     return {
         "market": "US",
@@ -126,6 +204,7 @@ def get_us_bars(
         "end": end,
         "bars": out
     }
+
 
 @app.post("/guardrails", response_model=GuardrailsOut)
 def guardrails(payload: GuardrailsIn):
@@ -149,6 +228,7 @@ def guardrails(payload: GuardrailsIn):
         return GuardrailsOut(validation_level="L1", analysis_blocked=False, warnings=["ohlc_minor_issues"])
 
     return GuardrailsOut(validation_level="L2", analysis_blocked=False, warnings=[])
+
 
 @app.post("/ta/us", response_model=TAOut)
 def ta_us(payload: TAIn):
@@ -176,6 +256,7 @@ def ta_us(payload: TAIn):
         R1=round(r1, 2),
         invalidation=f"close < {s1:.2f}"
     )
+
 
 @app.get("/market_context/us")
 def market_context_us():
