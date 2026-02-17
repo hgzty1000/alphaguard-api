@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import os
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -55,12 +56,29 @@ def get_us_bars(
     tf: str = Query("15Min"),
     limit: int = Query(500, ge=50, le=5000),
     session: str = Query("regular"),
+    start: str | None = Query(None, description="ISO8601, e.g. 2026-02-01T00:00:00Z"),
+    end: str | None = Query(None, description="ISO8601, e.g. 2026-02-10T00:00:00Z"),
 ):
     if session != "regular":
         raise HTTPException(400, "MVP supports session=regular only")
 
+    # ✅ 默认取最近 7 天（UTC），避免盘前/午夜空 bars
+    now = datetime.now(timezone.utc)
+    if start is None:
+        start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if end is None:
+        end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     url = f"{ALPACA_DATA_BASE}/v2/stocks/bars"
-    params = {"symbols": symbol.upper(), "timeframe": tf, "limit": limit}
+    params = {
+        "symbols": symbol.upper(),
+        "timeframe": tf,
+        "limit": limit,
+        "start": start,
+        "end": end,
+        # 建议显式指定 feed，免费层一般用 iex（若你有 sip 订阅也可改）
+        "feed": "iex",
+    }
     r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Alpaca error: {r.text}")
@@ -75,7 +93,9 @@ def get_us_bars(
         "close": b["c"],
         "volume": b["v"],
     } for b in bars]
-    return {"market": "US", "symbol": symbol.upper(), "timeframe": tf, "session": session, "bars": out}
+
+    return {"market": "US", "symbol": symbol.upper(), "timeframe": tf, "session": session, "start": start, "end": end, "bars": out}
+
 
 @app.post("/guardrails", response_model=GuardrailsOut)
 def guardrails(payload: GuardrailsIn):
