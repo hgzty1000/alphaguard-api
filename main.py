@@ -1,11 +1,11 @@
-from datetime import datetime, timedelta, timezone
 import os
 import requests
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Any, Dict
 
-app = FastAPI(title="AlphaGuard US API", version="0.1.0")
+app = FastAPI(title="AlphaGuard US API", version="0.2.0")
 
 ALPACA_KEY = os.getenv("ALPACA_KEY_ID", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
@@ -19,6 +19,7 @@ def alpaca_headers():
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
 
+# ---------------- Models ----------------
 class OHLCVBar(BaseModel):
     timestamp: str
     open: float
@@ -50,24 +51,44 @@ class TAOut(BaseModel):
     R1: Optional[float] = None
     invalidation: str
 
+# ---------------- Helpers ----------------
+def _normalize_alpaca_bars(payload: Dict[str, Any], symbol: str) -> List[Dict[str, Any]]:
+    """
+    Alpaca /v2/stocks/bars 可能返回：
+    - {"bars": {"AAPL": [ {...}, {...} ]}}
+    - 或 {"bars": [ {...}, {...} ]} （较少见）
+    这里统一成 list[dict]
+    """
+    bars_obj = payload.get("bars", {})
+
+    if isinstance(bars_obj, dict):
+        return bars_obj.get(symbol.upper(), []) or []
+    if isinstance(bars_obj, list):
+        return bars_obj
+    return []
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# ---------------- Endpoints ----------------
 @app.get("/us/bars")
 def get_us_bars(
-    symbol: str = Query(...),
-    tf: str = Query("15Min"),
+    symbol: str = Query(..., description="US ticker, e.g. AAPL"),
+    tf: str = Query("15Min", description="Alpaca timeframe: 15Min / 1Day etc."),
     limit: int = Query(500, ge=50, le=5000),
-    session: str = Query("regular"),
-    start: str | None = Query(None, description="ISO8601, e.g. 2026-02-01T00:00:00Z"),
-    end: str | None = Query(None, description="ISO8601, e.g. 2026-02-10T00:00:00Z"),
+    session: str = Query("regular", description="MVP: regular only"),
+    start: Optional[str] = Query(None, description="ISO8601 UTC, e.g. 2026-02-01T00:00:00Z"),
+    end: Optional[str] = Query(None, description="ISO8601 UTC, e.g. 2026-02-10T00:00:00Z"),
 ):
     if session != "regular":
         raise HTTPException(400, "MVP supports session=regular only")
 
-    # ✅ 默认取最近 7 天（UTC），避免盘前/午夜空 bars
+    # ✅ 默认拉最近 7 天，避免盘前/当天无 bars 返回空
     now = datetime.now(timezone.utc)
     if start is None:
-        start = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        start = _iso_utc(now - timedelta(days=7))
     if end is None:
-        end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = _iso_utc(now)
 
     url = f"{ALPACA_DATA_BASE}/v2/stocks/bars"
     params = {
@@ -76,15 +97,17 @@ def get_us_bars(
         "limit": limit,
         "start": start,
         "end": end,
-        # 建议显式指定 feed，免费层一般用 iex（若你有 sip 订阅也可改）
+        # 免费/默认通常用 iex；如你有 SIP 订阅可改成 "sip"
         "feed": "iex",
     }
+
     r = requests.get(url, headers=alpaca_headers(), params=params, timeout=20)
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"Alpaca error: {r.text}")
 
     data = r.json()
-    bars = data.get("bars", [])
+    bars_list = _normalize_alpaca_bars(data, symbol)
+
     out = [{
         "timestamp": b["t"],
         "open": b["o"],
@@ -92,10 +115,17 @@ def get_us_bars(
         "low": b["l"],
         "close": b["c"],
         "volume": b["v"],
-    } for b in bars]
+    } for b in bars_list]
 
-    return {"market": "US", "symbol": symbol.upper(), "timeframe": tf, "session": session, "start": start, "end": end, "bars": out}
-
+    return {
+        "market": "US",
+        "symbol": symbol.upper(),
+        "timeframe": tf,
+        "session": session,
+        "start": start,
+        "end": end,
+        "bars": out
+    }
 
 @app.post("/guardrails", response_model=GuardrailsOut)
 def guardrails(payload: GuardrailsIn):
@@ -104,7 +134,7 @@ def guardrails(payload: GuardrailsIn):
         return GuardrailsOut(validation_level="L1", analysis_blocked=False, warnings=["bars_too_few"])
 
     ts = [b.timestamp for b in bars]
-    if any(ts[i] <= ts[i-1] for i in range(1, len(ts))):
+    if any(ts[i] <= ts[i - 1] for i in range(1, len(ts))):
         return GuardrailsOut(validation_level="L0", analysis_blocked=True, block_reason="time_invalid")
 
     bad = 0
@@ -112,6 +142,7 @@ def guardrails(payload: GuardrailsIn):
         if b.high < max(b.open, b.close) or b.low > min(b.open, b.close) or b.low > b.high:
             bad += 1
     ratio = bad / len(bars)
+
     if ratio > 0.01:
         return GuardrailsOut(validation_level="L0", analysis_blocked=True, block_reason="ohlc_invalid")
     elif ratio > 0:
@@ -129,7 +160,6 @@ def ta_us(payload: TAIn):
     s1 = min(b.low for b in window)
     r1 = max(b.high for b in window)
 
-    # 超简版趋势：看最近收盘相对区间位置
     last = bars[-1].close
     mid = (s1 + r1) / 2
     if last > mid:
